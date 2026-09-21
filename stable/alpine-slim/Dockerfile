@@ -3,12 +3,13 @@
 #
 # PLEASE DO NOT EDIT IT DIRECTLY.
 #
-FROM alpine:3.17
+FROM alpine:3.24
 
 LABEL maintainer="NGINX Docker Maintainers <docker-maint@nginx.com>"
 
-ENV NGINX_VERSION 1.24.0
-ENV PKG_RELEASE   1
+ENV NGINX_VERSION  1.30.5
+ENV PKG_RELEASE    1
+ENV DYNPKG_RELEASE 1
 
 RUN set -x \
 # create nginx user/group first, to be consistent throughout docker variants
@@ -34,7 +35,16 @@ RUN set -x \
                 echo "key verification failed!"; \
                 exit 1; \
             fi \
-            && apk add -X "https://nginx.org/packages/alpine/v$(egrep -o '^[0-9]+\.[0-9]+' /etc/alpine-release)/main" --no-cache $nginxPackages \
+# we need to make sure nginx.org packages are pulled in, which isnt guaranteed
+# as Alpine repos might have the same version in the repos.
+# query nginx.org binaries for the dependencies
+            && DEPS=$(apk query --summarize depends --recursive --no-cache \
+                       --repository "@nginxorg https://nginx.org/packages/alpine/v$(egrep -o '^[0-9]+\.[0-9]+' /etc/alpine-release)/main" \
+                       ${nginxPackages/=/@nginxorg=}) \
+# install those dependencies from Alpine repos
+            && apk add --no-cache $DEPS \
+# limit apk to nginx.org repos only to install the requested packages
+            && apk add --repositories-file /dev/null -X "https://nginx.org/packages/alpine/v$(egrep -o '^[0-9]+\.[0-9]+' /etc/alpine-release)/main" --no-cache $nginxPackages \
             ;; \
         *) \
 # we're on an architecture upstream doesn't officially build for
@@ -53,11 +63,12 @@ RUN set -x \
                 bash \
                 alpine-sdk \
                 findutils \
+                curl \
             && su nobody -s /bin/sh -c " \
                 export HOME=${tempDir} \
                 && cd ${tempDir} \
-                && curl -f -O https://hg.nginx.org/pkg-oss/archive/${NGINX_VERSION}-${PKG_RELEASE}.tar.gz \
-                && PKGOSSCHECKSUM=\"dc47dbaeb1c0874b264d34ddfec40e7d2b814e7db48d144e12d5991c743ef5fcf780ecbab72324e562dd84bb9c0e4dd71d14850b20ceaf470c46f8fe7510275b *${NGINX_VERSION}-${PKG_RELEASE}.tar.gz\" \
+                && curl -f -L -O https://github.com/nginx/pkg-oss/archive/${NGINX_VERSION}-${PKG_RELEASE}.tar.gz \
+                && PKGOSSCHECKSUM=\"feaa7c9e587e59a01e229c2396433a9f0bccd6ce381afae9311b7496d1c2b53f93b2b0b2adece8f76fa06b92ca6b6a706103ef2c0a26e00afe82dfcdf8135a23 *${NGINX_VERSION}-${PKG_RELEASE}.tar.gz\" \
                 && if [ \"\$(openssl sha512 -r ${NGINX_VERSION}-${PKG_RELEASE}.tar.gz)\" = \"\$PKGOSSCHECKSUM\" ]; then \
                     echo \"pkg-oss tarball checksum verification succeeded!\"; \
                 else \
@@ -68,37 +79,27 @@ RUN set -x \
                 && cd pkg-oss-${NGINX_VERSION}-${PKG_RELEASE} \
                 && cd alpine \
                 && make base \
-                && apk index -o ${tempDir}/packages/alpine/${apkArch}/APKINDEX.tar.gz ${tempDir}/packages/alpine/${apkArch}/*.apk \
+                && apk index --allow-untrusted -o ${tempDir}/packages/alpine/${apkArch}/APKINDEX.tar.gz ${tempDir}/packages/alpine/${apkArch}/*.apk \
                 && abuild-sign -k ${tempDir}/.abuild/abuild-key.rsa ${tempDir}/packages/alpine/${apkArch}/APKINDEX.tar.gz \
                 " \
             && cp ${tempDir}/.abuild/abuild-key.rsa.pub /etc/apk/keys/ \
             && apk del --no-network .build-deps \
-            && apk add -X ${tempDir}/packages/alpine/ --no-cache $nginxPackages \
+# same as in the "arches officially built by upstream" block, we want to make
+# sure the packages we've just built will get installed
+            && DEPS=$(apk query --summarize depends --recursive --no-cache \
+                       --repository "@nginxorg ${tempDir}/packages/alpine/" \
+                       ${nginxPackages/=/@nginxorg=}) \
+            && apk add --no-cache $DEPS \
+            && apk add --repositories-file /dev/null -X ${tempDir}/packages/alpine/ --no-cache $nginxPackages \
             ;; \
     esac \
 # remove checksum deps
     && apk del --no-network .checksum-deps \
 # if we have leftovers from building, let's purge them (including extra, unnecessary build deps)
     && if [ -n "$tempDir" ]; then rm -rf "$tempDir"; fi \
-    && if [ -n "/etc/apk/keys/abuild-key.rsa.pub" ]; then rm -f /etc/apk/keys/abuild-key.rsa.pub; fi \
-    && if [ -n "/etc/apk/keys/nginx_signing.rsa.pub" ]; then rm -f /etc/apk/keys/nginx_signing.rsa.pub; fi \
-# Bring in gettext so we can get `envsubst`, then throw
-# the rest away. To do this, we need to install `gettext`
-# then move `envsubst` out of the way so `gettext` can
-# be deleted completely, then move `envsubst` back.
-    && apk add --no-cache --virtual .gettext gettext \
-    && mv /usr/bin/envsubst /tmp/ \
-    \
-    && runDeps="$( \
-        scanelf --needed --nobanner /tmp/envsubst \
-            | awk '{ gsub(/,/, "\nso:", $2); print "so:" $2 }' \
-            | sort -u \
-            | xargs -r apk info --installed \
-            | sort -u \
-    )" \
-    && apk add --no-cache $runDeps \
-    && apk del --no-network .gettext \
-    && mv /tmp/envsubst /usr/local/bin/ \
+    && if [ -f "/etc/apk/keys/abuild-key.rsa.pub" ]; then rm -f /etc/apk/keys/abuild-key.rsa.pub; fi \
+# Add `envsubst` for templating environment variables
+    && apk add --no-cache gettext-envsubst \
 # Bring in tzdata so users could set the timezones through the environment
 # variables
     && apk add --no-cache tzdata \
